@@ -1,0 +1,179 @@
+# Import necessary modules with error handling
+function Ensure-ModuleInstalled {
+    param ([string]$ModuleName)
+    if (-not (Get-Module -ListAvailable -Name $ModuleName)) {
+        Write-Host "Installing $ModuleName module..."
+        try {
+            Install-Module -Name $ModuleName -Force -Scope CurrentUser -AllowClobber
+        }
+        catch {
+            Write-Host "ERROR: Failed to install $ModuleName. $_"
+            exit 1
+        }
+    }
+    Import-Module $ModuleName
+}
+
+Ensure-ModuleInstalled "ImportExcel"
+Ensure-ModuleInstalled "VMware.VimAutomation.Core"
+
+# Set paths and current date-time
+$basePath = (Get-Location).Path
+$baselineExcelPath = Join-Path -Path $basePath -ChildPath "baseline.xlsx"
+$vcenterInputFile = Join-Path -Path $basePath -ChildPath "vCenters.txt"
+$outputDir = Join-Path -Path $basePath -ChildPath "Output"
+$reportDateTime = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
+
+# Ensure output directory exists
+if (!(Test-Path -Path $outputDir)) {
+    New-Item -ItemType Directory -Path $outputDir | Out-Null
+}
+
+# Initialize logging with a transcript
+$logFile = Join-Path -Path $outputDir -ChildPath "script_log_$reportDateTime.txt"
+Start-Transcript -Path $logFile
+
+function Write-Log {
+    param ([string]$Message)
+    $logMessage = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') - $Message"
+    Write-Host $logMessage
+    Add-Content -Path $logFile -Value $logMessage
+}
+
+Write-Log "Script started"
+
+# Initialize HTML content
+$htmlContent = @"
+<html>
+<head>
+    <title>Role Comparison Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        table { border-collapse: collapse; width: 100%; margin-bottom: 20px; }
+        th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+        th { background-color: #f4f4f4; }
+        .new-role { background-color: #d9edf7; }
+        .modified-role { background-color: #fff3cd; }
+        .missing-role { background-color: #f2dede; }
+    </style>
+</head>
+<body>
+    <h1>Role Comparison Report</h1>
+    <p>Generated on $(Get-Date -Format "yyyy-MM-dd HH:mm:ss")</p>
+"@
+
+# Safe join function with improved null and empty checks
+function Safe-Join {
+    param ([array]$inputArray, [string]$separator = ", ")
+    if ($null -eq $inputArray -or $inputArray.Count -eq 0) {
+        Write-Log "WARNING: Null or empty array detected in Safe-Join."
+        return ""
+    }
+    return ($inputArray | Where-Object { $_ -ne $null -and $_ -ne "" } | ForEach-Object { $_.ToString().Trim() }) -join $separator
+}
+
+# Function to load baseline data with error handling
+function Load-BaselineData {
+    param ([string]$ExcelPath)
+    Write-Log "Loading baseline data from $ExcelPath"
+    try {
+        $baselineData = @{}
+        $excel = Open-ExcelPackage -Path $ExcelPath
+        foreach ($worksheet in $excel.Workbook.Worksheets) {
+            $vCenterName = $worksheet.Name
+            $baselineData[$vCenterName] = @(
+                $worksheet | ConvertFrom-ExcelData | ForEach-Object {
+                    [pscustomobject]@{
+                        RoleName      = $_.RoleName
+                        RoleType      = $_.RoleType
+                        AssignedUsers = $_.AssignedUsers
+                        Privileges    = $_.Privileges
+                    }
+                }
+            )
+        }
+        Close-ExcelPackage $excel
+        return $baselineData
+    }
+    catch {
+        Write-Log "ERROR: Failed to load baseline data. $_"
+        exit 1
+    }
+}
+
+# Function to compare roles and append to HTML report
+function Compare-Roles {
+    param ($baselineRoles, $currentRoles, $vCenterName)
+
+    $htmlContent += "<h2>Role Comparison for $vCenterName</h2><table><tr><th>Role Name</th><th>Status</th><th>Details</th></tr>"
+
+    $baselineRoleNames = $baselineRoles | Select-Object -ExpandProperty RoleName
+    $currentRoleNames = $currentRoles | Select-Object -ExpandProperty RoleName
+
+    foreach ($role in $baselineRoleNames) {
+        $baselineRole = $baselineRoles | Where-Object { $_.RoleName -eq $role }
+        $currentRole = $currentRoles | Where-Object { $_.RoleName -eq $role }
+        if ($null -eq $currentRole) {
+            $htmlContent += "<tr class='missing-role'><td>$role</td><td>Missing</td><td>Role exists in baseline but not in vCenter</td></tr>"
+        } else {
+            $differences = Compare-Object $baselineRole.Privileges $currentRole.Privileges
+            if ($differences) {
+                $htmlContent += "<tr class='modified-role'><td>$role</td><td>Modified</td><td>Privileges changed</td></tr>"
+            }
+        }
+    }
+
+    foreach ($role in $currentRoleNames) {
+        if ($role -notin $baselineRoleNames) {
+            $htmlContent += "<tr class='new-role'><td>$role</td><td>New</td><td>Role exists in vCenter but not in baseline</td></tr>"
+        }
+    }
+
+    $htmlContent += "</table>"
+}
+
+# Main logic with enhanced progress tracking and error handling
+$vCenters = Get-Content $vcenterInputFile | ForEach-Object { $_.Trim() -split ',' | ForEach-Object { $_.Trim() } }
+$totalVCenters = $vCenters.Count
+$processedVCenters = 0
+
+foreach ($vCenterInfo in $vCenters) {
+    $vCenterName = $vCenterInfo[0]
+    $vCenterShortName = $vCenterInfo[1]
+    Write-Progress -Activity "Processing vCenters" -Status "Processing $vCenterName" -PercentComplete (($processedVCenters / $totalVCenters) * 100)
+
+    Write-Log "Processing vCenter: $vCenterName ($vCenterShortName)"
+
+    try {
+        Connect-VIServer -Server $vCenterName -Credential $cred -ErrorAction Stop
+
+        $currentRoles = Get-RolesAndPermissions -vCenter $vCenterName -vCenterShortName $vCenterShortName -cred $cred
+
+        if (-not (Validate-Baseline -baselineData $baselineData -vCenterShortName $vCenterShortName)) {
+            continue
+        }
+
+        $baselineRoles = Normalize-RoleData $baselineData[$vCenterShortName]
+        Compare-Roles -baselineRoles $baselineRoles -currentRoles $currentRoles -vCenterName $vCenterName
+    }
+    catch {
+        Write-Log "ERROR: Failed to process ${vCenterName}: $_"
+    }
+    finally {
+        Disconnect-VIServer -Server $vCenterName -Force -Confirm:$false
+        Write-Log "Disconnected from $vCenterName"
+    }
+
+    $processedVCenters++
+    Write-Progress -Activity "Processing vCenters" -Status "Completed $vCenterName" -PercentComplete (($processedVCenters / $totalVCenters) * 100)
+}
+
+# Finalize and save HTML report
+$htmlContent += "</body></html>"
+$htmlReportPath = Join-Path -Path $outputDir -ChildPath "RoleComparisonReport_$reportDateTime.html"
+$htmlContent | Out-File -FilePath $htmlReportPath -Encoding utf8
+
+Write-Log "Report generated successfully: $htmlReportPath"
+Stop-Transcript
+
+Write-Host "Script completed successfully."
